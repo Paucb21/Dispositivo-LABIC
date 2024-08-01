@@ -1,0 +1,242 @@
+// Directiva para depuración, comenta para desactivar
+#define DEPURAR
+
+#include <ArduinoBearSSL.h>
+#include <ArduinoECCX08.h>
+#include <ArduinoMqttClient.h>
+#include <WiFi101.h>
+#include "secrets.h"
+#include <SPI.h>
+#include <WiFiUdp.h>
+#include <RTCZero.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <SHT21.h> // Biblioteca para el sensor SHT21
+#include <Adafruit_BNO055.h> // Biblioteca para el sensor BNO055
+#include <Adafruit_Sensor.h> // Biblioteca base para sensores Adafruit
+#include <HX711.h> // Biblioteca para la galga extensiométrica
+
+// Claves de conexión WiFi y MQTT
+const char ssid[] = SECRET_SSID;
+const char pass[] = SECRET_PASS;
+const char broker[] = SECRET_BROKER;
+const char* certificado = SECRET_CERTIFICATE;
+const int puertoMQTT = 8883;
+
+// Constantes de temporización
+const uint16_t retrasoMensaje = 100;
+const uint16_t intervalo = 10000;
+unsigned long milisegundosPrevios = 0;
+
+// Información del dispositivo
+String fechaRTC, horaRTC, dispositivo = "TEST MKR1";
+
+// Estado de solicitud
+enum EstadoSolicitud { SOLICITUD_INCORRECTA = 0, SOLICITUD_CORRECTA = 1 } estadoSolicitud;
+
+// Inicialización de hardware y bibliotecas
+WiFiClient clienteWiFi;
+BearSSLClient clienteSSL(clienteWiFi);
+MqttClient clienteMQTT(clienteSSL);
+RTCZero rtc;
+SHT21 sht21;
+Adafruit_BNO055 bno = Adafruit_BNO055(55);
+HX711 galga;
+
+// Pin para el potenciómetro lineal
+const int pinPotenciometro = A0;
+
+void configuracion() {
+    Serial.begin(115200);
+    Wire.begin();
+
+    // Inicialización del sensor SHT21
+    if (!sht21.begin()) {
+        Serial.println("Error al inicializar el SHT21");
+        while (1);
+    }
+
+    // Inicialización del sensor BNO055
+    if (!bno.begin()) {
+        Serial.println("Error al inicializar el BNO055");
+        while (1);
+    }
+
+    // Configuración del BNO055 para el modo NDOF
+    bno.setExtCrystalUse(true);
+
+    // Inicialización de la galga extensiométrica
+    galga.begin(5, 6); // Pines de conexión de la galga: DOUT en 5 y SCK en 6
+
+    // Inicialización del módulo ECCX08
+    if (!ECCX08.begin()) {
+        Serial.println("Error al inicializar el ECCX08");
+        while (1);
+    }
+
+    // Configuración de SSL y MQTT
+    ArduinoBearSSL.onGetTime(obtenerTiempo);
+    clienteSSL.setEccSlot(0, certificado);
+    clienteMQTT.onMessage(mensajeRecibido);
+
+    // Conexión a WiFi y sincronización de tiempo
+    conectarWiFi();
+    rtc.begin();
+
+    if (!sincronizarTiempo()) {
+        Serial.println("Error al sincronizar el tiempo con NTP");
+        while (1);
+    }
+
+    milisegundosPrevios = millis();
+    Serial.println("Dispositivo iniciado...");
+}
+
+void buclePrincipal() {
+    unsigned long milisegundosActuales = millis();
+
+    // Revisa y mantiene la conexión WiFi
+    if (WiFi.status() != WL_CONNECTED) {
+        conectarWiFi();
+    }
+
+    // Revisa y mantiene la conexión MQTT
+    if (!clienteMQTT.connected()) {
+        conectarMQTT();
+    }
+
+    clienteMQTT.poll();
+
+    // Envía datos a AWS en intervalos regulares
+    if (milisegundosActuales - milisegundosPrevios >= intervalo) {
+        // Lectura de datos del sensor SHT21
+        float temperatura = sht21.readTemperature();
+        float humedad = sht21.readHumidity();
+
+        // Lectura de datos del sensor BNO055
+        sensors_event_t datosOrientacion, datosAceleracion;
+        bno.getEvent(&datosOrientacion, Adafruit_BNO055::VECTOR_EULER);
+        bno.getEvent(&datosAceleracion, Adafruit_BNO055::VECTOR_ACCELEROMETER);
+
+        // Lectura de datos de la galga extensiométrica
+        float flexion = galga.get_units();
+
+        // Lectura de datos del potenciómetro lineal
+        int valorPotenciometro = analogRead(pinPotenciometro);
+        float elongacion = map(valorPotenciometro, 0, 1023, 0, 100); // Escala del potenciómetro
+
+        // Envío de datos a AWS
+        enviarDatosAWS(temperatura, humedad, datosOrientacion, datosAceleracion, flexion, elongacion);
+        milisegundosPrevios = milisegundosActuales;
+    }
+}
+
+bool sincronizarTiempo() {
+    uint8_t numeroIntentos = 0, intentosMaximos = 6;
+    unsigned long epoch;
+
+    // Intenta sincronizar con el servidor NTP
+    do {
+        epoch = WiFi.getTime();
+        numeroIntentos++;
+        delay(retrasoMensaje);
+    } while ((epoch == 0) && (numeroIntentos < intentosMaximos));
+
+    if (epoch != 0) {
+        rtc.setEpoch(epoch);
+        return true;
+    }
+    return false;
+}
+
+void enviarDatosAWS(float temp, float hum, sensors_event_t orientacion, sensors_event_t aceleracion, float flexion, float elongacion) {
+    char bufferJSON[256];
+    StaticJsonDocument<256> doc;
+
+    obtenerFecha();  // Asegura que la fecha y hora del RTC estén actualizadas
+
+    // Creación del documento JSON
+    doc["Fecha"] = fechaRTC;
+    doc["Hora"] = horaRTC;
+    doc["Dispositivo"] = dispositivo;
+    doc["ID"] = WiFi.getTime();
+    doc["Temperatura"] = temp;
+    doc["Humedad"] = hum;
+    doc["OrientacionX"] = orientacion.orientation.x;
+    doc["OrientacionY"] = orientacion.orientation.y;
+    doc["OrientacionZ"] = orientacion.orientation.z;
+    doc["AceleracionX"] = aceleracion.acceleration.x;
+    doc["AceleracionY"] = aceleracion.acceleration.y;
+    doc["AceleracionZ"] = aceleracion.acceleration.z;
+    doc["Flexion"] = flexion;
+    doc["Elongacion"] = elongacion;
+
+    serializeJson(doc, bufferJSON);
+
+    // Publicación del mensaje MQTT
+    clienteMQTT.beginMessage("outTopic");
+    clienteMQTT.print(bufferJSON);
+    clienteMQTT.endMessage();
+
+    imprimirSerial("Mensaje publicado: " + String(bufferJSON));
+}
+
+void obtenerFecha() {
+    // Formateo de la fecha y hora del RTC
+    horaRTC = String(rtc.getHours()) + ":" + String(rtc.getMinutes()) + ":" + String(rtc.getSeconds());
+    fechaRTC = String(rtc.getDay()) + "/" + String(rtc.getMonth()) + "/" + String(rtc.getYear() + 2000);
+}
+
+void conectarWiFi() {
+    // Conexión a la red WiFi
+    Serial.print("Conectando a WiFi: ");
+    Serial.println(ssid);
+
+    while (WiFi.begin(ssid, pass) != WL_CONNECTED) {
+        delay(retrasoMensaje);
+        Serial.print(".");
+    }
+
+    Serial.println("Conectado a WiFi");
+}
+
+void conectarMQTT() {
+    // Conexión al broker MQTT
+    Serial.println("Conectando a MQTT...");
+
+    while (!clienteMQTT.connect(broker, puertoMQTT)) {
+        delay(retrasoMensaje);
+        Serial.print(".");
+    }
+
+    Serial.println("Conectado a MQTT");
+
+    clienteMQTT.subscribe("inTopic");
+}
+
+void mensajeRecibido(int tamanoMensaje) {
+    // Manejo de mensajes recibidos desde MQTT
+    StaticJsonDocument<60> doc;
+    String cargaUtil;
+
+    while (clienteMQTT.available()) {
+        cargaUtil += ((char)clienteMQTT.read());
+    }
+
+    deserializeJson(doc, cargaUtil);
+    const char* mensaje = doc["mensaje"];
+
+    imprimirSerial("Mensaje recibido: " + String(mensaje));
+}
+
+unsigned long obtenerTiempo() {
+    // Obtiene la hora desde el módulo WiFi
+    return WiFi.getTime();
+}
+
+void imprimirSerial(String textoSerial) {
+    // Imprime mensajes de depuración en el monitor serie
+#ifdef DEPURAR
+    Serial.println(textoSerial);
+#endif
+}
